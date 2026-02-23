@@ -7,3 +7,4 @@ k-means-constrained
 shapely
 numpy
 fiona
+scikit-learn
