@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import Point, MultiPoint, Polygon
+from shapely.geometry import Point, MultiPoint
 from shapely.ops import voronoi_diagram
 import folium
 from streamlit_folium import st_folium
@@ -12,19 +12,21 @@ import fiona
 import zipfile
 import os
 import matplotlib.colors as mcolors
+import osmnx as ox
+import warnings
 
-# Konfigurasi Driver KML
+warnings.filterwarnings('ignore') # Mengabaikan warning shapely/pandas
+
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
-st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Rapi)")
+st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Road Bounds)")
 
-st.title("🗺️ Perencanaan FTTH: Clustering ODP Rapi (Voronoi)")
-st.markdown("Menggunakan algoritma *Voronoi Tessellation* untuk membuat batas coverage yang rapi, lurus, dan tanpa tumpang tindih seperti peta profesional.")
+st.title("🗺️ FTTH Clustering: Batas Rapi Mengikuti Jalan")
+st.markdown("Menggunakan Voronoi yang dipotong otomatis oleh jaringan jalan (OpenStreetMap) sehingga batas ODP tidak menyeberang jalan.")
 
 # --- FUNGSI PENDUKUNG ---
 def process_spatial_file(file):
-    """Membaca KML/KMZ dan mengambil titik homepass"""
     if file.name.endswith('.kmz'):
         with zipfile.ZipFile(file, 'r') as kmz:
             kml_filename = [f for f in kmz.namelist() if f.endswith('.kml')][0]
@@ -38,7 +40,6 @@ def process_spatial_file(file):
         os.remove("temp.kml")
         
     points_only = gdf[gdf.geometry.type == 'Point']
-    # Pastikan menggunakan CRS (Sistem Koordinat) standar WGS84
     if points_only.crs is None:
         points_only.set_crs(epsg=4326, inplace=True)
     else:
@@ -46,152 +47,145 @@ def process_spatial_file(file):
         
     return pd.DataFrame({'id': range(1, len(points_only) + 1), 'lon': points_only.geometry.x, 'lat': points_only.geometry.y})
 
-def create_voronoi_boundaries(df_points, cluster_col='final_odp_id'):
-    """
-    Fungsi inti untuk membuat batas Voronoi yang rapi dari hasil clustering.
-    """
-    # 1. Buat GeoDataFrame dari semua titik
-    gdf_points = gpd.GeoDataFrame(df_points, geometry=gpd.points_from_xy(df_points.lon, df_points.lat), crs="EPSG:4326")
+def get_road_network(gdf_points):
+    """Men-download jaringan jalan dari OSM berdasarkan area titik homepass"""
+    # Ambil batas area (Bounding Box)
+    west, south, east, north = gdf_points.total_bounds
+    # Tambah buffer sedikit untuk margin
+    buffer_deg = 0.002 
+    bbox = (west - buffer_deg, south - buffer_deg, east + buffer_deg, north + buffer_deg)
+    
+    try:
+        # Download semua tipe jalan (jalan raya sampai gang kecil)
+        roads = ox.features_from_bbox(bbox=bbox, tags={'highway': True})
+        return roads
+    except Exception as e:
+        st.warning("Gagal mengunduh jalan dari OSM. Batas akan menggunakan Voronoi biasa.")
+        return None
 
-    # 2. Hitung Centroid (Titik Tengah) dari setiap Cluster ODP
-    # Kita perlu proyeksi ke meter (misal UTM) untuk perhitungan centroid yang akurat, lalu balik ke WGS84
-    # Cara cepat: pakai perkiraan rata-rata lat/lon (cukup untuk area kecil)
+def create_physical_boundaries(df_points, cluster_col='final_odp_id'):
+    """Membuat batas yang dipotong oleh jalan fisik"""
+    gdf_points = gpd.GeoDataFrame(df_points, geometry=gpd.points_from_xy(df_points.lon, df_points.lat), crs="EPSG:4326")
+    
+    # 1. Hitung Centroid
     centroids_data = []
     for cluster_id, group in df_points.groupby(cluster_col):
-        center_lon = group['lon'].mean()
-        center_lat = group['lat'].mean()
-        centroids_data.append({'odp_id': cluster_id, 'geometry': Point(center_lon, center_lat)})
-    
+        centroids_data.append({'odp_id': cluster_id, 'geometry': Point(group['lon'].mean(), group['lat'].mean())})
     gdf_centroids = gpd.GeoDataFrame(centroids_data, crs="EPSG:4326")
 
-    # 3. Buat Masker Pembatas (Area Proyek Total)
-    # Ini agar Voronoi tidak meluas sampai tak terhingga. Kita pakai Convex Hull dari SEMUA titik + buffer sedikit.
-    total_hull = gdf_points.unary_union.convex_hull
-    # Buffer sedikit (misal 0.0005 derajat ~ 50 meter) agar titik terluar tidak pas di garis
-    mask_polygon = total_hull.buffer(0.0005)
+    # 2. Buat Voronoi Dasar (Lebar)
+    mask_polygon = gdf_points.unary_union.convex_hull.buffer(0.001)
     gdf_mask = gpd.GeoDataFrame(geometry=[mask_polygon], crs="EPSG:4326")
-
-    # 4. Generate Voronoi Diagram dari Centroid
-    # Kita gunakan MultiPoint dari semua centroid sebagai input
-    centroids_multipoint = MultiPoint(gdf_centroids['geometry'].tolist())
-    # Envelope adalah kotak pembatas untuk perhitungan awal Voronoi
-    voronoi_raw = voronoi_diagram(centroids_multipoint, envelope=mask_polygon.envelope)
     
-    # Konversi hasil Voronoi mentah menjadi GeoDataFrame
+    centroids_multipoint = MultiPoint(gdf_centroids['geometry'].tolist())
+    voronoi_raw = voronoi_diagram(centroids_multipoint, envelope=mask_polygon.envelope)
     gdf_voronoi_raw = gpd.GeoDataFrame(geometry=list(voronoi_raw.geoms), crs="EPSG:4326")
+    
+    # Gabungkan ID ODP ke poligon Voronoi
+    gdf_voronoi = gpd.sjoin(gdf_voronoi_raw, gdf_centroids, how="inner", predicate="contains")
+    gdf_voronoi = gpd.clip(gdf_voronoi, gdf_mask)
 
-    # 5. Proses Spasial Join & Clipping (Bagian paling rumit)
-    # Masalah: Voronoi dihasilkan urutan acak, kita harus tahu poligon mana milik ODP ID berapa.
-    # Solusi: Lakukan Spatial Join antara poligon Voronoi dengan titik Centroid-nya.
-    gdf_voronoi_joined = gpd.sjoin(gdf_voronoi_raw, gdf_centroids, how="inner", predicate="contains")
-
-    # 6. Potong (Clip) Voronoi dengan Masker Area Proyek
-    # Agar pinggirannya rapi mengikuti bentuk area proyek secara keseluruhan
-    gdf_final_boundaries = gpd.clip(gdf_voronoi_joined, gdf_mask)
-
-    return gdf_final_boundaries, gdf_points
+    # 3. PROSES PEMOTONGAN JALAN (ROAD CUTTER)
+    roads_gdf = get_road_network(gdf_points)
+    
+    if roads_gdf is not None and not roads_gdf.empty:
+        # Konversi ke CRS meter (Web Mercator) untuk membuat lebar jalan yang akurat
+        gdf_voronoi_m = gdf_voronoi.to_crs(epsg=3857)
+        roads_m = roads_gdf.to_crs(epsg=3857)
+        gdf_points_m = gdf_points.to_crs(epsg=3857)
+        
+        # Buat ketebalan jalan (buffer 3 meter)
+        # Jalan akan menjadi "tembok" tebal 3 meter yang memotong poligon
+        road_buffer = roads_m.geometry.buffer(3) 
+        road_union = road_buffer.unary_union
+        
+        # Potong (Difference) Voronoi dengan Area Jalan
+        gdf_voronoi_cut = gdf_voronoi_m.difference(road_union)
+        
+        # Memecah poligon yang terbelah jalan menjadi poligon-poligon terpisah
+        gdf_exploded = gdf_voronoi_cut.explode(index_parts=False).reset_index()
+        
+        # HANYA simpan potongan area yang benar-benar berisi titik homepass
+        # (Membuang sisa potongan seberang jalan yang kosong)
+        final_polygons = []
+        for _, odp_area in gdf_exploded.iterrows():
+            poly = odp_area['geometry']
+            odp_id = odp_area['odp_id']
+            # Cek apakah ada titik homepass ODP ini di dalam potongan poligon ini
+            points_in_this_odp = gdf_points_m[gdf_points_m[cluster_col] == odp_id]
+            if points_in_this_odp.geometry.within(poly).any():
+                final_polygons.append({'odp_id': odp_id, 'geometry': poly})
+                
+        if final_polygons:
+            gdf_final = gpd.GeoDataFrame(final_polygons, crs="EPSG:3857")
+            # Kembalikan ke format koordinat GPS (WGS84)
+            return gdf_final.to_crs(epsg=4326), gdf_points
+            
+    return gdf_voronoi, gdf_points
 
 # --- UI UTAMA ---
 uploaded_file = st.file_uploader("Unggah File KML/KMZ (Titik Homepass)", type=['kml', 'kmz'])
 
 st.sidebar.header("Pengaturan Jaringan")
 max_capacity = st.sidebar.number_input("Kapasitas Maksimal per ODP", min_value=4, max_value=64, value=16)
-chunk_size = st.sidebar.number_input("Ukuran Area Makro (Untuk Kecepatan)", min_value=100, max_value=2000, value=500)
-opacity_slider = st.sidebar.slider("Transparansi Warna Area", 0.1, 1.0, 0.5)
+chunk_size = st.sidebar.number_input("Ukuran Area Makro", min_value=100, max_value=2000, value=500)
 
 if uploaded_file is not None:
-    with st.spinner('Mengekstrak data spasial...'):
-        try:
-            df_hp = process_spatial_file(uploaded_file)
-            st.success(f"Data dimuat: {len(df_hp)} titik homepass.")
-            
-            if st.button("Mulai Proses Clustering Rapi"):
-                with st.spinner('Langkah 1/3: Menghitung Clustering (Makro & Mikro)...'):
-                    # --- PROSES CLUSTERING (Sama seperti sebelumnya untuk kecepatan) ---
-                    coords = df_hp[['lat', 'lon']].values
-                    n_macro_clusters = max(1, len(df_hp) // chunk_size)
-                    kmeans_macro = KMeans(n_clusters=n_macro_clusters, random_state=42, n_init='auto')
-                    df_hp['macro_id'] = kmeans_macro.fit_predict(coords)
-                    
-                    df_hp['final_odp_id'] = -1
-                    global_odp_counter = 0
-                    
-                    for macro_id in range(n_macro_clusters):
-                        mask = df_hp['macro_id'] == macro_id
-                        macro_data = df_hp[mask]
-                        if len(macro_data) == 0: continue
-                        
-                        n_micro = int(np.ceil(len(macro_data) / max_capacity))
-                        # Penanganan jika titik sangat sedikit
-                        n_micro = max(1, n_micro)
-                        if len(macro_data) < n_micro: n_micro = len(macro_data) # Safety check
+    with st.spinner('Mengekstrak data...'):
+        df_hp = process_spatial_file(uploaded_file)
+        
+        if st.button("Mulai Proses Boundary Fisik"):
+            # 1. K-Means Constrained (Sama seperti sebelumnya)
+            with st.spinner('Menghitung kelompok per 16 titik...'):
+                coords = df_hp[['lat', 'lon']].values
+                n_macro = max(1, len(df_hp) // chunk_size)
+                df_hp['macro_id'] = KMeans(n_clusters=n_macro, random_state=42).fit_predict(coords)
+                
+                df_hp['final_odp_id'] = -1
+                global_odp_counter = 0
+                for macro_id in range(n_macro):
+                    mask = df_hp['macro_id'] == macro_id
+                    macro_data = df_hp[mask]
+                    if len(macro_data) == 0: continue
+                    n_micro = max(1, int(np.ceil(len(macro_data) / max_capacity)))
+                    clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
+                    df_hp.loc[mask, 'final_odp_id'] = clf.fit_predict(macro_data[['lat', 'lon']].values) + global_odp_counter
+                    global_odp_counter += n_micro
 
-                        clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
-                        micro_labels = clf.fit_predict(macro_data[['lat', 'lon']].values)
-                        df_hp.loc[mask, 'final_odp_id'] = micro_labels + global_odp_counter
-                        global_odp_counter += n_micro
-                    
-                    num_odp_created = df_hp['final_odp_id'].nunique()
-                    st.info(f"Clustering selesai. Terbentuk {num_odp_created} ODP.")
+            # 2. Proses Geometri Pemotong Jalan
+            with st.spinner('Men-download data jalan OSM & memotong batas area (Bisa memakan waktu 1-2 menit)...'):
+                gdf_boundaries, gdf_points_all = create_physical_boundaries(df_hp)
 
-                with st.spinner('Langkah 2/3: Membuat Batas Wilayah Rapi (Voronoi)...'):
-                    # --- PROSES GEOMETRI VORONOI BARU ---
-                    # Hanya jalankan jika jumlah ODP > 1, Voronoi butuh minimal 2 titik
-                    if num_odp_created > 1:
-                        gdf_boundaries, gdf_points_all = create_voronoi_boundaries(df_hp)
-                    else:
-                        # Fallback jika cuma ada 1 ODP, pakai Convex Hull biasa + buffer
-                        gdf_points_all = gpd.GeoDataFrame(df_hp, geometry=gpd.points_from_xy(df_hp.lon, df_hp.lat), crs="EPSG:4326")
-                        hull = gdf_points_all.unary_union.convex_hull.buffer(0.0002)
-                        gdf_boundaries = gpd.GeoDataFrame({'odp_id': [df_hp['final_odp_id'].iloc[0]], 'geometry': [hull]}, crs="EPSG:4326")
+            # 3. Render Peta
+            with st.spinner('Merender Peta...'):
+                base_colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
+                def get_color(odp_id): return base_colors[int(odp_id) % len(base_colors)]
 
-                with st.spinner('Langkah 3/3: Merender Peta Interaktif...'):
-                    # --- RENDER PETA ---
-                    # Siapkan palet warna yang banyak dan berbeda
-                    base_colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
-                    
-                    # Fungsi untuk mendapatkan warna berdasarkan ODP ID
-                    def get_color(odp_id):
-                        return base_colors[int(odp_id) % len(base_colors)]
+                center_lat, center_lon = df_hp['lat'].mean(), df_hp['lon'].mean()
+                # Menggunakan tile hybrid/satellite agar mirip Google Earth
+                m = folium.Map(location=[center_lat, center_lon], zoom_start=16, tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri')
+                
+                # Render Area
+                folium.GeoJson(
+                    gdf_boundaries,
+                    style_function=lambda f: {
+                        'fillColor': get_color(f['properties']['odp_id']),
+                        'color': 'white', # Garis putih agar kontras dengan satelit
+                        'weight': 1.5,
+                        'fillOpacity': 0.5
+                    },
+                    tooltip=folium.GeoJsonTooltip(fields=['odp_id'], aliases=['ODP ID:'])
+                ).add_to(m)
 
-                    center_lat, center_lon = df_hp['lat'].mean(), df_hp['lon'].mean()
-                    m = folium.Map(location=[center_lat, center_lon], zoom_start=15, prefer_canvas=True, tiles="CartoDB positron")
-
-                    # 1. Layer Area Coverage (Poligon Rapi)
-                    folium.GeoJson(
-                        gdf_boundaries,
-                        name="Area Coverage ODP",
-                        style_function=lambda feature: {
-                            'fillColor': get_color(feature['properties']['odp_id']),
-                            'color': 'black', # Garis pinggir hitam tipis agar tegas
-                            'weight': 1,
-                            'fillOpacity': opacity_slider
-                        },
-                        tooltip=folium.GeoJsonTooltip(fields=['odp_id'], aliases=['ODP ID:'])
+                # Render Titik
+                for _, row in df_hp.iterrows():
+                    folium.CircleMarker(
+                        location=[row['lat'], row['lon']], radius=3,
+                        color='black', weight=1, fill=True, fillColor='#ffcc00', fillOpacity=1
                     ).add_to(m)
 
-                    # 2. Layer Titik Homepass (Titik kecil)
-                    # Kita warnai titiknya sesuai warna areanya agar serasi
-                    for _, row in df_hp.iterrows():
-                        pt_color = get_color(row['final_odp_id'])
-                        folium.CircleMarker(
-                            location=[row['lat'], row['lon']],
-                            radius=2,
-                            color='black',
-                            weight=0.5,
-                            fill=True,
-                            fillColor=pt_color,
-                            fillOpacity=1.0,
-                            popup=f"HP ID: {row['id']} | ODP: {row['final_odp_id']}"
-                        ).add_to(m)
+                st.subheader(f"Hasil: {global_odp_counter} ODP (Terpotong oleh Jalan)")
+                st_folium(m, width=1200, height=700, returned_objects=[])
 
-                    folium.LayerControl().add_to(m)
-                    st.success("Selesai! Peta telah diperbarui dengan batas yang rapi.")
-                    st_folium(m, width=1200, height=700, returned_objects=[])
-                    
-        except Exception as e:
-            st.error(f"Terjadi kesalahan detail: {e}")
-            import traceback
-            st.code(traceback.format_exc()) # Tampilkan error lengkap untuk debugging
 else:
-    st.info("Silakan unggah file KML atau KMZ berisi titik homepass.")
+    st.info("Unggah KML/KMZ untuk memulai.")

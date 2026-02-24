@@ -9,3 +9,4 @@ numpy
 fiona
 scikit-learn
 matplotlib
+osmnx
