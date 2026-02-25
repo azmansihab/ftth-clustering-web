@@ -22,8 +22,8 @@ fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
 st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Rapi & Terarah)")
 
-st.title("🗺️ FTTH Clustering: Sapuan Kanan ke Kiri (Timur ke Barat)")
-st.markdown("Menggunakan metode *Spatial Slicing* untuk memastikan area ODP terbentuk lebih konsisten, berurutan dari arah Kanan peta ke Kiri, dibatasi oleh jalan fisik.")
+st.title("🗺️ FTTH Clustering: Sapuan Kanan ke Kiri & Export Data")
+st.markdown("Sistem ini memotong batas area ODP menggunakan jalan fisik (OSM), menyapu urutan dari Timur ke Barat, dan memungkinkan Anda mengunduh hasilnya (KML/CSV).")
 
 # --- FUNGSI PENDUKUNG ---
 
@@ -116,10 +116,9 @@ def create_physical_boundaries(df_points, cluster_col='final_odp_id'):
 # --- UI UTAMA STREAMLIT ---
 
 st.sidebar.header("Pengaturan Jaringan")
-# Default diubah menjadi 20 sesuai permintaan
 max_capacity = st.sidebar.number_input("Kapasitas Maks per ODP", min_value=4, max_value=64, value=20)
 chunk_size = st.sidebar.number_input("Ukuran Pita Sapuan (Titik)", min_value=50, max_value=1000, value=200)
-opacity_slider = st.sidebar.slider("Transparansi Warna", 0.1, 1.0, 0.4)
+opacity_slider = st.sidebar.slider("Transparansi Warna Area", 0.1, 1.0, 0.4)
 
 uploaded_file = st.file_uploader("Unggah File KML/KMZ (Titik Homepass)", type=['kml', 'kmz'])
 
@@ -130,14 +129,9 @@ if uploaded_file is not None:
         if st.button("Mulai Proses Boundary (Kanan ke Kiri)"):
             
             with st.spinner('Langkah 1: Mengurutkan titik dari Kanan ke Kiri & Clustering...'):
-                
-                # --- LOGIKA BARU: SPATIAL SWEEPING (KANAN KE KIRI) ---
-                # 1. Mengurutkan data berdasarkan Longitude (Bujur) dari Timur (Kanan) ke Barat (Kiri)
                 df_hp = df_hp.sort_values(by='lon', ascending=False).reset_index(drop=True)
-                
-                # 2. Membagi titik menjadi "Pita/Irisan Vertikal"
-                # Karena data sudah urut Kanan->Kiri, membaginya dengan qcut akan membuat pita-pita dari Timur ke Barat
                 n_macro = max(1, len(df_hp) // chunk_size)
+                
                 if n_macro > 1:
                     df_hp['macro_id'] = pd.qcut(df_hp.index, q=n_macro, labels=False, duplicates='drop')
                 else:
@@ -146,19 +140,15 @@ if uploaded_file is not None:
                 df_hp['final_odp_id'] = -1
                 global_odp_counter = 0
                 
-                # 3. Proses Clustering di dalam masing-masing pita vertikal
                 for macro_id in sorted(df_hp['macro_id'].unique()):
                     mask = df_hp['macro_id'] == macro_id
                     macro_data = df_hp[mask]
                     if len(macro_data) == 0: continue
                     
-                    # Agar tidak acak di dalam pita, kita bisa urutkan lagi berdasarkan Latitude (Utara-Selatan)
                     macro_data = macro_data.sort_values(by='lat', ascending=False)
-                    
                     n_micro = max(1, int(np.ceil(len(macro_data) / max_capacity)))
                     clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
                     
-                    # Fit algoritma
                     micro_labels = clf.fit_predict(macro_data[['lat', 'lon']].values)
                     df_hp.loc[macro_data.index, 'final_odp_id'] = micro_labels + global_odp_counter
                     global_odp_counter += n_micro
@@ -198,7 +188,44 @@ if uploaded_file is not None:
                         popup=f"ODP: {row['final_odp_id']}"
                     ).add_to(m)
 
-                st.subheader(f"Selesai: {global_odp_counter} ODP Terbentuk (Arah Kanan ke Kiri)")
+                st.subheader(f"Selesai: {global_odp_counter} ODP Terbentuk")
+                
+                # --- FITUR DOWNLOAD BARU ---
+                st.markdown("### 📥 Unduh Hasil Desain (Export)")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Export CSV untuk data rumah
+                    csv_data = df_hp.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📄 Unduh Data Homepass (CSV)",
+                        data=csv_data,
+                        file_name="hasil_clustering_homepass.csv",
+                        mime="text/csv",
+                        help="Unduh data tabel koordinat rumah beserta pembagian ID ODP-nya."
+                    )
+                    
+                with col2:
+                    # Export KML untuk Poligon Boundary
+                    kml_file_path = "hasil_boundary_odp.kml"
+                    # Hapus file sementara jika sebelumnya sudah ada
+                    if os.path.exists(kml_file_path):
+                        os.remove(kml_file_path)
+                        
+                    # Pastikan CRS standar dan simpan ke KML
+                    gdf_boundaries_export = gdf_boundaries.to_crs(epsg=4326)
+                    gdf_boundaries_export.to_file(kml_file_path, driver='KML')
+                    
+                    with open(kml_file_path, "rb") as kml_file:
+                        st.download_button(
+                            label="🗺️ Unduh Boundary (KML)",
+                            data=kml_file,
+                            file_name="hasil_boundary_odp.kml",
+                            mime="application/vnd.google-earth.kml+xml",
+                            help="Unduh poligon batas area untuk dibuka di Google Earth atau QGIS."
+                        )
+
+                # Tampilkan Peta setelah tombol download
                 st_folium(m, width=1200, height=700, returned_objects=[])
 
 else:
