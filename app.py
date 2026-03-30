@@ -2,31 +2,32 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, MultiPoint
+from shapely.ops import voronoi_diagram
 import folium
 from streamlit_folium import st_folium
+from k_means_constrained import KMeansConstrained
 import fiona
 import zipfile
 import os
 import matplotlib.colors as mcolors
+import osmnx as ox
+import warnings
 
 # Mengabaikan warning bawaan
-import warnings
 warnings.filterwarnings('ignore')
 
-# Mengaktifkan driver KML
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
-st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Rectangle Grid)")
+st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Final Pro)")
 
-st.title("🗺️ FTTH Clustering: Batas Rectangle (Grid Spasial)")
-st.markdown("Membagi titik homepass menggunakan sapuan Timur-Barat & Utara-Selatan untuk menghasilkan batas **Persegi Panjang (Rectangle)** yang sangat rapi, konsisten, dan terarah.")
+st.title("🗺️ FTTH Clustering Final: Voronoi Rapi & Sapuan Terarah")
+st.markdown("Kombinasi terbaik: Poligon Voronoi yang rapat mengisi ruang, dipotong oleh jalan fisik (OSM), dengan urutan titik disapu rapi dari Kanan ke Kiri.")
 
 # --- FUNGSI PENDUKUNG ---
 
 def process_spatial_file(file):
-    """Membaca data KML/KMZ dan mengambil koordinat"""
     if file.name.endswith('.kmz'):
         with zipfile.ZipFile(file, 'r') as kmz:
             kml_filename = [f for f in kmz.namelist() if f.endswith('.kml')][0]
@@ -52,33 +53,76 @@ def process_spatial_file(file):
         'lat': points_only.geometry.y
     })
 
-def create_rectangular_boundaries(df_points, cluster_col='final_odp_id'):
-    """Membuat batas Bounding Box (Rectangle) untuk setiap ODP"""
+def get_road_network(gdf_points):
+    west, south, east, north = gdf_points.total_bounds
+    buffer_deg = 0.003 # Buffer area jalan diperluas sedikit
+    bbox = (west - buffer_deg, south - buffer_deg, east + buffer_deg, north + buffer_deg)
+    
+    try:
+        roads = ox.features_from_bbox(bbox=bbox, tags={'highway': True})
+        return roads
+    except Exception as e:
+        return None
+
+def create_voronoi_road_boundaries(df_points, cluster_col='final_odp_id'):
     gdf_points = gpd.GeoDataFrame(
         df_points, geometry=gpd.points_from_xy(df_points.lon, df_points.lat), crs="EPSG:4326"
     )
     
-    polygons = []
-    for odp_id, group in gdf_points.groupby(cluster_col):
-        # Mengambil semua titik dalam 1 ODP
-        points_union = group.geometry.unary_union
+    # 1. Hitung Centroid
+    centroids_data = []
+    for cluster_id, group in df_points.groupby(cluster_col):
+        centroids_data.append({'odp_id': cluster_id, 'geometry': Point(group['lon'].mean(), group['lat'].mean())})
+    gdf_centroids = gpd.GeoDataFrame(centroids_data, crs="EPSG:4326")
+
+    # 2. Voronoi Dasar (Lebar mengisi ruang)
+    mask_polygon = gdf_points.unary_union.convex_hull.buffer(0.0015)
+    gdf_mask = gpd.GeoDataFrame(geometry=[mask_polygon], crs="EPSG:4326")
+    
+    centroids_multipoint = MultiPoint(gdf_centroids['geometry'].tolist())
+    voronoi_raw = voronoi_diagram(centroids_multipoint, envelope=mask_polygon.envelope)
+    gdf_voronoi_raw = gpd.GeoDataFrame(geometry=list(voronoi_raw.geoms), crs="EPSG:4326")
+    
+    gdf_voronoi = gpd.sjoin(gdf_voronoi_raw, gdf_centroids, how="inner", predicate="contains")
+    gdf_voronoi = gpd.clip(gdf_voronoi, gdf_mask)
+
+    # 3. Potong dengan Jalan (Road Cutter)
+    roads_gdf = get_road_network(gdf_points)
+    
+    if roads_gdf is not None and not roads_gdf.empty:
+        gdf_voronoi_m = gdf_voronoi.to_crs(epsg=3857)
+        roads_m = roads_gdf.to_crs(epsg=3857)
+        gdf_points_m = gdf_points.to_crs(epsg=3857)
         
-        # .envelope secara otomatis membuat bentuk Rectangle sempurna (Bounding Box)
-        # Kita beri buffer (tambahan jarak) sangat kecil agar titik tidak persis di garis tepi
-        rect = points_union.envelope.buffer(0.00015).envelope 
+        # Buffer tebal jalan 3 meter
+        road_buffer = roads_m.geometry.buffer(3) 
+        road_union = road_buffer.unary_union
         
-        polygons.append({'odp_id': odp_id, 'geometry': rect})
+        gdf_voronoi_cut = gdf_voronoi_m.copy()
+        gdf_voronoi_cut['geometry'] = gdf_voronoi_m.geometry.difference(road_union)
+        gdf_voronoi_cut = gdf_voronoi_cut[~gdf_voronoi_cut.geometry.is_empty]
+        gdf_exploded = gdf_voronoi_cut.explode(index_parts=False).reset_index(drop=True)
         
-    gdf_boundaries = gpd.GeoDataFrame(polygons, crs="EPSG:4326")
-    return gdf_boundaries, gdf_points
+        final_polygons = []
+        for _, odp_area in gdf_exploded.iterrows():
+            poly = odp_area.geometry 
+            odp_id = odp_area['odp_id']
+            points_in_this_odp = gdf_points_m[gdf_points_m[cluster_col] == odp_id]
+            if not points_in_this_odp.empty and points_in_this_odp.geometry.within(poly).any():
+                final_polygons.append({'odp_id': odp_id, 'geometry': poly})
+                
+        if final_polygons:
+            gdf_final = gpd.GeoDataFrame(final_polygons, crs="EPSG:3857")
+            return gdf_final.to_crs(epsg=4326), gdf_points
+            
+    return gdf_voronoi, gdf_points
 
 # --- UI UTAMA STREAMLIT ---
 
 st.sidebar.header("Pengaturan Jaringan")
-max_capacity = st.sidebar.number_input("Kapasitas Maks per ODP", min_value=4, max_value=64, value=20)
-# Chunk size ini akan menentukan "Lebar Pita" sapuan vertikal dari kanan ke kiri
-chunk_size = st.sidebar.number_input("Lebar Sapuan Kolom (Titik)", min_value=50, max_value=1000, value=200)
-opacity_slider = st.sidebar.slider("Transparansi Warna Area", 0.1, 1.0, 0.4)
+max_capacity = st.sidebar.number_input("Kapasitas Maks per ODP", min_value=4, max_value=64, value=16)
+chunk_size = st.sidebar.number_input("Ukuran Pita Sapuan (Titik)", min_value=50, max_value=1000, value=200)
+opacity_slider = st.sidebar.slider("Transparansi Warna Area", 0.1, 1.0, 0.45)
 
 uploaded_file = st.file_uploader("Unggah File KML/KMZ (Titik Homepass)", type=['kml', 'kmz'])
 
@@ -86,42 +130,40 @@ if uploaded_file is not None:
     with st.spinner('Membaca data file spasial...'):
         df_hp = process_spatial_file(uploaded_file)
         
-        if st.button("Mulai Proses Boundary Rectangle (Kanan ke Kiri)"):
+        if st.button("Mulai Proses Final (Voronoi + Jalan + Sapuan)"):
             
-            with st.spinner('Langkah 1: Slicing Grid Spasial (Super Cepat)...'):
-                # 1. SAPUAN SUMBU X (TIMUR KE BARAT)
-                # Urutkan rumah dari Kanan (Timur) ke Kiri (Barat)
-                df_hp = df_hp.sort_values(by='lon', ascending=False).reset_index(drop=True)
+            with st.spinner('Langkah 1: Mengurutkan titik dari Kanan ke Kiri & Clustering...'):
                 
-                # Potong menjadi beberapa kolom vertikal
-                n_cols = max(1, len(df_hp) // chunk_size)
-                if n_cols > 1:
-                    df_hp['col_id'] = pd.qcut(df_hp.index, q=n_cols, labels=False, duplicates='drop')
+                # --- LOGIKA SPATIAL SWEEPING (KANAN KE KIRI) ---
+                df_hp = df_hp.sort_values(by='lon', ascending=False).reset_index(drop=True)
+                n_macro = max(1, len(df_hp) // chunk_size)
+                
+                if n_macro > 1:
+                    df_hp['macro_id'] = pd.qcut(df_hp.index, q=n_macro, labels=False, duplicates='drop')
                 else:
-                    df_hp['col_id'] = 0
+                    df_hp['macro_id'] = 0
                 
                 df_hp['final_odp_id'] = -1
                 global_odp_counter = 0
                 
-                # 2. SAPUAN SUMBU Y (UTARA KE SELATAN) DI DALAM SETIAP KOLOM
-                for col_id in sorted(df_hp['col_id'].unique()):
-                    mask = df_hp['col_id'] == col_id
-                    col_data = df_hp[mask]
-                    if len(col_data) == 0: continue
+                for macro_id in sorted(df_hp['macro_id'].unique()):
+                    mask = df_hp['macro_id'] == macro_id
+                    macro_data = df_hp[mask]
+                    if len(macro_data) == 0: continue
                     
-                    # Urutkan dari Atas (Utara) ke Bawah (Selatan)
-                    col_data = col_data.sort_values(by='lat', ascending=False).reset_index()
+                    # Urutkan Atas ke Bawah di dalam pita vertikal
+                    macro_data = macro_data.sort_values(by='lat', ascending=False)
+                    n_micro = max(1, int(np.ceil(len(macro_data) / max_capacity)))
                     
-                    # Potong tegas tepat per `max_capacity` (misal 20 titik)
-                    # Ini memastikan isi ODP pas 20 dan bentuknya mengotak rapi
-                    col_data['micro_id'] = col_data.index // max_capacity
+                    # Constrained Clustering agar maksimal isi rumah tetap terjaga
+                    clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
+                    micro_labels = clf.fit_predict(macro_data[['lat', 'lon']].values)
                     
-                    # Simpan ID final
-                    df_hp.loc[col_data['index'], 'final_odp_id'] = col_data['micro_id'] + global_odp_counter
-                    global_odp_counter += col_data['micro_id'].nunique()
+                    df_hp.loc[macro_data.index, 'final_odp_id'] = micro_labels + global_odp_counter
+                    global_odp_counter += n_micro
 
-            with st.spinner('Langkah 2: Membentuk Geometri Bounding Box...'):
-                gdf_boundaries, gdf_points_all = create_rectangular_boundaries(df_hp)
+            with st.spinner('Langkah 2: Menarik data Jalan OSM & Membentuk Voronoi Rapat (Mohon tunggu 1-2 menit)...'):
+                gdf_boundaries, gdf_points_all = create_voronoi_road_boundaries(df_hp)
 
             with st.spinner('Langkah 3: Merender Peta Satelit...'):
                 base_colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
@@ -135,14 +177,14 @@ if uploaded_file is not None:
                     attr='Esri'
                 )
                 
-                # Render Area (Rectangle)
+                # Render Area Voronoi Terpotong Jalan
                 folium.GeoJson(
                     gdf_boundaries,
-                    name="Boundary ODP (Rectangle)",
+                    name="Boundary ODP",
                     style_function=lambda f: {
                         'fillColor': get_color(f['properties']['odp_id']),
-                        'color': 'white', # Garis tepi putih tegas
-                        'weight': 2,
+                        'color': 'white', # Garis putih agar sangat jelas terlihat di peta satelit
+                        'weight': 1.5,
                         'fillOpacity': opacity_slider
                     },
                     tooltip=folium.GeoJsonTooltip(fields=['odp_id'], aliases=['ODP ID:'])
@@ -152,12 +194,12 @@ if uploaded_file is not None:
                 for _, row in df_hp.iterrows():
                     folium.CircleMarker(
                         location=[row['lat'], row['lon']], 
-                        radius=3,
-                        color='black', weight=1, fill=True, fillColor='#00ff00', fillOpacity=1,
+                        radius=2.5,
+                        color='black', weight=1, fill=True, fillColor='#ffcc00', fillOpacity=1,
                         popup=f"ODP: {row['final_odp_id']}"
                     ).add_to(m)
 
-                st.subheader(f"Selesai: {global_odp_counter} ODP Kotak Terbentuk")
+                st.subheader(f"Selesai: {global_odp_counter} ODP Terbentuk Rapi")
                 
                 # --- FITUR DOWNLOAD ---
                 st.markdown("### 📥 Unduh Hasil Desain (Export)")
@@ -173,7 +215,7 @@ if uploaded_file is not None:
                     )
                     
                 with col2:
-                    kml_file_path = "hasil_boundary_rectangle.kml"
+                    kml_file_path = "hasil_boundary_voronoi_jalan.kml"
                     if os.path.exists(kml_file_path):
                         os.remove(kml_file_path)
                         
@@ -182,9 +224,9 @@ if uploaded_file is not None:
                     
                     with open(kml_file_path, "rb") as kml_file:
                         st.download_button(
-                            label="🗺️ Unduh Boundary Kotak (KML)",
+                            label="🗺️ Unduh Boundary Rapat (KML)",
                             data=kml_file,
-                            file_name="hasil_boundary_rectangle.kml",
+                            file_name="hasil_boundary_voronoi_jalan.kml",
                             mime="application/vnd.google-earth.kml+xml"
                         )
 
