@@ -10,3 +10,4 @@ fiona
 scikit-learn
 matplotlib
 osmnx
+simplekml

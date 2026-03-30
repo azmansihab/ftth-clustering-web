@@ -12,6 +12,7 @@ import zipfile
 import os
 import matplotlib.colors as mcolors
 import osmnx as ox
+import simplekml
 import warnings
 
 # Mengabaikan warning bawaan
@@ -20,10 +21,10 @@ warnings.filterwarnings('ignore')
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
-st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Final Pro)")
+st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Warna KML)")
 
-st.title("🗺️ FTTH Clustering Final: Voronoi Rapi & Sapuan Terarah")
-st.markdown("Kombinasi terbaik: Poligon Voronoi yang rapat mengisi ruang, dipotong oleh jalan fisik (OSM), dengan urutan titik disapu rapi dari Kanan ke Kiri.")
+st.title("🗺️ FTTH Clustering: Export KML Berwarna")
+st.markdown("Poligon Voronoi rapat, dipotong jalan OSM, sapuan Kanan-Kiri, dan **hasil Export KML akan mempertahankan warna klasifikasi ODP di Google Earth**.")
 
 # --- FUNGSI PENDUKUNG ---
 
@@ -55,9 +56,8 @@ def process_spatial_file(file):
 
 def get_road_network(gdf_points):
     west, south, east, north = gdf_points.total_bounds
-    buffer_deg = 0.003 # Buffer area jalan diperluas sedikit
+    buffer_deg = 0.003
     bbox = (west - buffer_deg, south - buffer_deg, east + buffer_deg, north + buffer_deg)
-    
     try:
         roads = ox.features_from_bbox(bbox=bbox, tags={'highway': True})
         return roads
@@ -69,13 +69,11 @@ def create_voronoi_road_boundaries(df_points, cluster_col='final_odp_id'):
         df_points, geometry=gpd.points_from_xy(df_points.lon, df_points.lat), crs="EPSG:4326"
     )
     
-    # 1. Hitung Centroid
     centroids_data = []
     for cluster_id, group in df_points.groupby(cluster_col):
         centroids_data.append({'odp_id': cluster_id, 'geometry': Point(group['lon'].mean(), group['lat'].mean())})
     gdf_centroids = gpd.GeoDataFrame(centroids_data, crs="EPSG:4326")
 
-    # 2. Voronoi Dasar (Lebar mengisi ruang)
     mask_polygon = gdf_points.unary_union.convex_hull.buffer(0.0015)
     gdf_mask = gpd.GeoDataFrame(geometry=[mask_polygon], crs="EPSG:4326")
     
@@ -86,7 +84,6 @@ def create_voronoi_road_boundaries(df_points, cluster_col='final_odp_id'):
     gdf_voronoi = gpd.sjoin(gdf_voronoi_raw, gdf_centroids, how="inner", predicate="contains")
     gdf_voronoi = gpd.clip(gdf_voronoi, gdf_mask)
 
-    # 3. Potong dengan Jalan (Road Cutter)
     roads_gdf = get_road_network(gdf_points)
     
     if roads_gdf is not None and not roads_gdf.empty:
@@ -94,7 +91,6 @@ def create_voronoi_road_boundaries(df_points, cluster_col='final_odp_id'):
         roads_m = roads_gdf.to_crs(epsg=3857)
         gdf_points_m = gdf_points.to_crs(epsg=3857)
         
-        # Buffer tebal jalan 3 meter
         road_buffer = roads_m.geometry.buffer(3) 
         road_union = road_buffer.unary_union
         
@@ -117,6 +113,46 @@ def create_voronoi_road_boundaries(df_points, cluster_col='final_odp_id'):
             
     return gdf_voronoi, gdf_points
 
+# --- FUNGSI EXPORT KML BERWARNA ---
+def export_colored_kml(gdf_boundaries, filepath, get_color_func, opacity_float):
+    """Membuat KML manual dengan simplekml agar warna Google Earth sesuai dengan Web"""
+    kml = simplekml.Kml()
+    
+    # Fungsi ubah Hex (#RRGGBB) ke Format KML Google Earth (AABBGGRR)
+    def to_kml_color(hex_str, alpha):
+        hex_str = hex_str.lstrip('#')
+        if len(hex_str) == 3: hex_str = ''.join([c*2 for c in hex_str])
+        r, g, b = hex_str[0:2], hex_str[2:4], hex_str[4:6]
+        a = f"{int(alpha * 255):02X}"
+        return f"{a}{b}{g}{r}"
+
+    for _, row in gdf_boundaries.iterrows():
+        odp_id = row['odp_id']
+        geom = row['geometry']
+        
+        # Ambil warna asli dari fungsi warna kita
+        hex_color = get_color_func(odp_id)
+        kml_color = to_kml_color(hex_color, opacity_float)
+        
+        # Pastikan kita menangani Polygon tunggal atau MultiPolygon (terpotong jalan)
+        geoms = [geom] if geom.geom_type == 'Polygon' else geom.geoms
+        
+        for g in geoms:
+            pol = kml.newpolygon(name=f"ODP {odp_id}")
+            # Masukkan kordinat garis luar
+            pol.outerboundaryis = list(g.exterior.coords)
+            # Masukkan kordinat lubang (jika ada jalan memutar di tengah)
+            pol.innerboundaryis = [list(i.coords) for i in g.interiors]
+            
+            # Terapkan Warna dan Transparansi ke KML
+            pol.style.polystyle.color = kml_color
+            # Buat garis pinggir poligon warna putih solid
+            pol.style.linestyle.color = to_kml_color('#ffffff', 1.0)
+            pol.style.linestyle.width = 2
+            
+    kml.save(filepath)
+
+
 # --- UI UTAMA STREAMLIT ---
 
 st.sidebar.header("Pengaturan Jaringan")
@@ -132,9 +168,12 @@ if uploaded_file is not None:
         
         if st.button("Mulai Proses Final (Voronoi + Jalan + Sapuan)"):
             
+            # --- PALET WARNA GLOBAL ---
+            # Kita definisikan fungsi warna di luar agar bisa dipakai oleh Peta dan Export KML
+            base_colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
+            def get_color(odp_id): return base_colors[int(odp_id) % len(base_colors)]
+
             with st.spinner('Langkah 1: Mengurutkan titik dari Kanan ke Kiri & Clustering...'):
-                
-                # --- LOGIKA SPATIAL SWEEPING (KANAN KE KIRI) ---
                 df_hp = df_hp.sort_values(by='lon', ascending=False).reset_index(drop=True)
                 n_macro = max(1, len(df_hp) // chunk_size)
                 
@@ -151,24 +190,19 @@ if uploaded_file is not None:
                     macro_data = df_hp[mask]
                     if len(macro_data) == 0: continue
                     
-                    # Urutkan Atas ke Bawah di dalam pita vertikal
                     macro_data = macro_data.sort_values(by='lat', ascending=False)
                     n_micro = max(1, int(np.ceil(len(macro_data) / max_capacity)))
                     
-                    # Constrained Clustering agar maksimal isi rumah tetap terjaga
                     clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
                     micro_labels = clf.fit_predict(macro_data[['lat', 'lon']].values)
                     
                     df_hp.loc[macro_data.index, 'final_odp_id'] = micro_labels + global_odp_counter
                     global_odp_counter += n_micro
 
-            with st.spinner('Langkah 2: Menarik data Jalan OSM & Membentuk Voronoi Rapat (Mohon tunggu 1-2 menit)...'):
+            with st.spinner('Langkah 2: Menarik data Jalan OSM & Membentuk Voronoi Rapat...'):
                 gdf_boundaries, gdf_points_all = create_voronoi_road_boundaries(df_hp)
 
             with st.spinner('Langkah 3: Merender Peta Satelit...'):
-                base_colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
-                def get_color(odp_id): return base_colors[int(odp_id) % len(base_colors)]
-
                 center_lat, center_lon = df_hp['lat'].mean(), df_hp['lon'].mean()
                 m = folium.Map(
                     location=[center_lat, center_lon], 
@@ -177,20 +211,18 @@ if uploaded_file is not None:
                     attr='Esri'
                 )
                 
-                # Render Area Voronoi Terpotong Jalan
                 folium.GeoJson(
                     gdf_boundaries,
                     name="Boundary ODP",
                     style_function=lambda f: {
                         'fillColor': get_color(f['properties']['odp_id']),
-                        'color': 'white', # Garis putih agar sangat jelas terlihat di peta satelit
+                        'color': 'white', 
                         'weight': 1.5,
                         'fillOpacity': opacity_slider
                     },
                     tooltip=folium.GeoJsonTooltip(fields=['odp_id'], aliases=['ODP ID:'])
                 ).add_to(m)
 
-                # Render Titik Rumah
                 for _, row in df_hp.iterrows():
                     folium.CircleMarker(
                         location=[row['lat'], row['lon']], 
@@ -201,7 +233,7 @@ if uploaded_file is not None:
 
                 st.subheader(f"Selesai: {global_odp_counter} ODP Terbentuk Rapi")
                 
-                # --- FITUR DOWNLOAD ---
+                # --- FITUR DOWNLOAD WARNA ---
                 st.markdown("### 📥 Unduh Hasil Desain (Export)")
                 col1, col2 = st.columns(2)
                 
@@ -215,18 +247,19 @@ if uploaded_file is not None:
                     )
                     
                 with col2:
-                    kml_file_path = "hasil_boundary_voronoi_jalan.kml"
+                    kml_file_path = "hasil_boundary_berwarna.kml"
                     if os.path.exists(kml_file_path):
                         os.remove(kml_file_path)
                         
+                    # MENGGUNAKAN FUNGSI BARU UNTUK KML BERWARNA
                     gdf_boundaries_export = gdf_boundaries.to_crs(epsg=4326)
-                    gdf_boundaries_export.to_file(kml_file_path, driver='KML')
+                    export_colored_kml(gdf_boundaries_export, kml_file_path, get_color, opacity_slider)
                     
                     with open(kml_file_path, "rb") as kml_file:
                         st.download_button(
-                            label="🗺️ Unduh Boundary Rapat (KML)",
+                            label="🗺️ Unduh Boundary BERWARNA (KML)",
                             data=kml_file,
-                            file_name="hasil_boundary_voronoi_jalan.kml",
+                            file_name="hasil_boundary_berwarna.kml",
                             mime="application/vnd.google-earth.kml+xml"
                         )
 
