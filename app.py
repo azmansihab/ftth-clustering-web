@@ -7,6 +7,7 @@ from shapely.ops import voronoi_diagram
 import folium
 from streamlit_folium import st_folium
 from k_means_constrained import KMeansConstrained
+from sklearn.cluster import AgglomerativeClustering
 import fiona
 import zipfile
 import os
@@ -21,10 +22,10 @@ warnings.filterwarnings('ignore')
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
-st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Warna KML)")
+st.set_page_config(layout="wide", page_title="FTTH ODP Clustering (Distance Based)")
 
-st.title("🗺️ FTTH Clustering: Export KML Berwarna")
-st.markdown("Poligon Voronoi rapat, dipotong jalan OSM, sapuan Kanan-Kiri, dan **hasil Export KML akan mempertahankan warna klasifikasi ODP di Google Earth**.")
+st.title("🗺️ FTTH Clustering: Organik Berdasarkan Jarak (Maks 200m)")
+st.markdown("Mengelompokkan titik secara natural/mencar ke titik terdekat dalam batas jarak maksimal (Meter), dipadukan dengan batas maksimal kapasitas ODP (16 port), lalu dibungkus dengan Voronoi yang dipotong jalan.")
 
 # --- FUNGSI PENDUKUNG ---
 
@@ -113,12 +114,8 @@ def create_voronoi_road_boundaries(df_points, cluster_col='final_odp_id'):
             
     return gdf_voronoi, gdf_points
 
-# --- FUNGSI EXPORT KML BERWARNA ---
 def export_colored_kml(gdf_boundaries, filepath, get_color_func, opacity_float):
-    """Membuat KML manual dengan simplekml agar warna Google Earth sesuai dengan Web"""
     kml = simplekml.Kml()
-    
-    # Fungsi ubah Hex (#RRGGBB) ke Format KML Google Earth (AABBGGRR)
     def to_kml_color(hex_str, alpha):
         hex_str = hex_str.lstrip('#')
         if len(hex_str) == 3: hex_str = ''.join([c*2 for c in hex_str])
@@ -129,35 +126,28 @@ def export_colored_kml(gdf_boundaries, filepath, get_color_func, opacity_float):
     for _, row in gdf_boundaries.iterrows():
         odp_id = row['odp_id']
         geom = row['geometry']
-        
-        # Ambil warna asli dari fungsi warna kita
         hex_color = get_color_func(odp_id)
         kml_color = to_kml_color(hex_color, opacity_float)
         
-        # Pastikan kita menangani Polygon tunggal atau MultiPolygon (terpotong jalan)
         geoms = [geom] if geom.geom_type == 'Polygon' else geom.geoms
         
         for g in geoms:
             pol = kml.newpolygon(name=f"ODP {odp_id}")
-            # Masukkan kordinat garis luar
             pol.outerboundaryis = list(g.exterior.coords)
-            # Masukkan kordinat lubang (jika ada jalan memutar di tengah)
             pol.innerboundaryis = [list(i.coords) for i in g.interiors]
-            
-            # Terapkan Warna dan Transparansi ke KML
             pol.style.polystyle.color = kml_color
-            # Buat garis pinggir poligon warna putih solid
             pol.style.linestyle.color = to_kml_color('#ffffff', 1.0)
             pol.style.linestyle.width = 2
-            
     kml.save(filepath)
-
 
 # --- UI UTAMA STREAMLIT ---
 
 st.sidebar.header("Pengaturan Jaringan")
 max_capacity = st.sidebar.number_input("Kapasitas Maks per ODP", min_value=4, max_value=64, value=16)
-chunk_size = st.sidebar.number_input("Ukuran Pita Sapuan (Titik)", min_value=50, max_value=1000, value=200)
+
+# PENGATURAN BARU: JARAK MAKSIMAL DALAM METER
+max_distance = st.sidebar.number_input("Jarak Maksimal antar Rumah (Meter)", min_value=50, max_value=1000, value=200)
+
 opacity_slider = st.sidebar.slider("Transparansi Warna Area", 0.1, 1.0, 0.45)
 
 uploaded_file = st.file_uploader("Unggah File KML/KMZ (Titik Homepass)", type=['kml', 'kmz'])
@@ -166,40 +156,49 @@ if uploaded_file is not None:
     with st.spinner('Membaca data file spasial...'):
         df_hp = process_spatial_file(uploaded_file)
         
-        if st.button("Mulai Proses Final (Voronoi + Jalan + Sapuan)"):
+        if st.button("Mulai Proses (Organik Berdasarkan Jarak)"):
             
-            # --- PALET WARNA GLOBAL ---
-            # Kita definisikan fungsi warna di luar agar bisa dipakai oleh Peta dan Export KML
             base_colors = list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values())
             def get_color(odp_id): return base_colors[int(odp_id) % len(base_colors)]
 
-            with st.spinner('Langkah 1: Mengurutkan titik dari Kanan ke Kiri & Clustering...'):
-                df_hp = df_hp.sort_values(by='lon', ascending=False).reset_index(drop=True)
-                n_macro = max(1, len(df_hp) // chunk_size)
+            with st.spinner(f'Langkah 1: Clustering Jarak {max_distance}m & Kapasitas {max_capacity}...'):
                 
-                if n_macro > 1:
-                    df_hp['macro_id'] = pd.qcut(df_hp.index, q=n_macro, labels=False, duplicates='drop')
-                else:
-                    df_hp['macro_id'] = 0
+                # 1. Konversi Koordinat ke Meter (EPSG:3857) untuk mengukur jarak akurat
+                gdf_m = gpd.GeoDataFrame(
+                    df_hp, geometry=gpd.points_from_xy(df_hp.lon, df_hp.lat), crs="EPSG:4326"
+                ).to_crs(epsg=3857)
                 
+                coords_m = np.column_stack((gdf_m.geometry.x, gdf_m.geometry.y))
+                
+                # 2. Agglomerative Clustering (Mengelompokkan rumah yang jaraknya <= 200m)
+                agg_cluster = AgglomerativeClustering(
+                    n_clusters=None, 
+                    distance_threshold=max_distance, 
+                    linkage='complete' # Complete linkage memastikan diameter area maksimal adalah distance_threshold
+                )
+                df_hp['dist_cluster'] = agg_cluster.fit_predict(coords_m)
+                
+                # 3. Pengecekan Kapasitas (Maks 16 per area jarak)
                 df_hp['final_odp_id'] = -1
                 global_odp_counter = 0
                 
-                for macro_id in sorted(df_hp['macro_id'].unique()):
-                    mask = df_hp['macro_id'] == macro_id
-                    macro_data = df_hp[mask]
-                    if len(macro_data) == 0: continue
+                for dist_c in df_hp['dist_cluster'].unique():
+                    mask = df_hp['dist_cluster'] == dist_c
+                    group_data = df_hp[mask]
                     
-                    macro_data = macro_data.sort_values(by='lat', ascending=False)
-                    n_micro = max(1, int(np.ceil(len(macro_data) / max_capacity)))
-                    
-                    clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
-                    micro_labels = clf.fit_predict(macro_data[['lat', 'lon']].values)
-                    
-                    df_hp.loc[macro_data.index, 'final_odp_id'] = micro_labels + global_odp_counter
-                    global_odp_counter += n_micro
+                    if len(group_data) > max_capacity:
+                        # Jika area tersebut ternyata isinya lebih dari 16 rumah, kita potong lagi
+                        n_micro = int(np.ceil(len(group_data) / max_capacity))
+                        clf = KMeansConstrained(n_clusters=n_micro, size_min=1, size_max=max_capacity, random_state=42)
+                        micro_labels = clf.fit_predict(group_data[['lat', 'lon']].values)
+                        df_hp.loc[mask, 'final_odp_id'] = micro_labels + global_odp_counter
+                        global_odp_counter += n_micro
+                    else:
+                        # Jika sudah aman di bawah 16, langsung jadikan 1 ODP
+                        df_hp.loc[mask, 'final_odp_id'] = global_odp_counter
+                        global_odp_counter += 1
 
-            with st.spinner('Langkah 2: Menarik data Jalan OSM & Membentuk Voronoi Rapat...'):
+            with st.spinner('Langkah 2: Menarik data Jalan OSM & Membentuk Voronoi Rapat (Mohon tunggu)...'):
                 gdf_boundaries, gdf_points_all = create_voronoi_road_boundaries(df_hp)
 
             with st.spinner('Langkah 3: Merender Peta Satelit...'):
@@ -231,7 +230,7 @@ if uploaded_file is not None:
                         popup=f"ODP: {row['final_odp_id']}"
                     ).add_to(m)
 
-                st.subheader(f"Selesai: {global_odp_counter} ODP Terbentuk Rapi")
+                st.subheader(f"Selesai: {global_odp_counter} ODP Terbentuk secara Organik")
                 
                 # --- FITUR DOWNLOAD WARNA ---
                 st.markdown("### 📥 Unduh Hasil Desain (Export)")
@@ -239,29 +238,18 @@ if uploaded_file is not None:
                 
                 with col1:
                     csv_data = df_hp.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="📄 Unduh Data Homepass (CSV)",
-                        data=csv_data,
-                        file_name="hasil_clustering_homepass.csv",
-                        mime="text/csv"
-                    )
+                    st.download_button("📄 Unduh Data Homepass (CSV)", data=csv_data, file_name="hasil_clustering_homepass.csv", mime="text/csv")
                     
                 with col2:
-                    kml_file_path = "hasil_boundary_berwarna.kml"
+                    kml_file_path = "hasil_boundary_organik_berwarna.kml"
                     if os.path.exists(kml_file_path):
                         os.remove(kml_file_path)
                         
-                    # MENGGUNAKAN FUNGSI BARU UNTUK KML BERWARNA
                     gdf_boundaries_export = gdf_boundaries.to_crs(epsg=4326)
                     export_colored_kml(gdf_boundaries_export, kml_file_path, get_color, opacity_slider)
                     
                     with open(kml_file_path, "rb") as kml_file:
-                        st.download_button(
-                            label="🗺️ Unduh Boundary BERWARNA (KML)",
-                            data=kml_file,
-                            file_name="hasil_boundary_berwarna.kml",
-                            mime="application/vnd.google-earth.kml+xml"
-                        )
+                        st.download_button("🗺️ Unduh Boundary BERWARNA (KML)", data=kml_file, file_name="hasil_boundary_organik_berwarna.kml", mime="application/vnd.google-earth.kml+xml")
 
                 st_folium(m, width=1200, height=700, returned_objects=[])
 
